@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import pickle
 import random
 from dataclasses import dataclass
 
@@ -9,6 +10,48 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from model import SeqStructToptPredictor
+
+
+# ---------------------------------------------------------------------------
+# Load embeddings from pkl directories
+# ---------------------------------------------------------------------------
+
+def load_embeddings(esmc_dir, saprot_dir):
+    """Load sequence (ESMC) and structure (SaProt) embeddings, return only common IDs."""
+    esmc_files  = {f.split(" ")[0]: f for f in os.listdir(esmc_dir)  if f.endswith(".pkl")}
+    saprot_files = {f.replace(".pkl", ""): f for f in os.listdir(saprot_dir) if f.endswith(".pkl")}
+
+    common_ids = sorted(set(esmc_files) & set(saprot_files))
+    print(f"  ESMC={len(esmc_files)}  SaProt={len(saprot_files)}  common={len(common_ids)}")
+
+    seq_map, struct_map, y_map = {}, {}, {}
+    for uid in common_ids:
+        # Parse Topt from filename: "{uid} Topt={value}.pkl"
+        topt_str = esmc_files[uid].replace(uid, "").replace(" Topt=", "").replace(".pkl", "")
+        y_map[uid] = float(topt_str)
+
+        with open(os.path.join(esmc_dir, esmc_files[uid]), "rb") as f:
+            seq_emb = pickle.load(f)
+        with open(os.path.join(saprot_dir, saprot_files[uid]), "rb") as f:
+            struct_emb = pickle.load(f)
+
+        # Convert to torch tensors — handle numpy arrays or existing tensors
+        seq_map[uid]    = torch.as_tensor(seq_emb).float()
+        struct_map[uid] = torch.as_tensor(struct_emb).float()
+
+    return common_ids, seq_map, struct_map, y_map
+
+
+def build_sequential_adj(n):
+    """Build a normalised tridiagonal adjacency (chain connectivity) of size n×n."""
+    adj = torch.eye(n)
+    if n > 1:
+        idx = torch.arange(n - 1)
+        adj[idx, idx + 1] = 1.0
+        adj[idx + 1, idx] = 1.0
+    # Row-normalise
+    row_sum = adj.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    return adj / row_sum
 
 
 def set_seed(seed: int = 42):
@@ -22,10 +65,11 @@ def set_seed(seed: int = 42):
 # ---------------------------------------------------------------------------
 
 class ProteinDataset(Dataset):
-    def __init__(self, ids, seq_map, struct_map, y_map):
+    def __init__(self, ids, seq_map, struct_map, y_map, adj_map=None):
         self.ids = ids
         self.seq_map = seq_map
         self.struct_map = struct_map
+        self.adj_map = adj_map
         self.y_map = y_map
 
     def __len__(self):
@@ -33,69 +77,72 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         pid = self.ids[idx]
+        struct = self.struct_map[pid].float()
+        adj = self.adj_map[pid] if self.adj_map else build_sequential_adj(struct.shape[0])
         return (
             self.seq_map[pid].float(),
-            self.struct_map[pid].float(),
+            struct,
+            adj,
             torch.tensor(self.y_map[pid], dtype=torch.float32),
         )
 
 
 @dataclass
 class Batch:
-    seq: torch.Tensor         # [B, S, D_seq]
-    struct: torch.Tensor      # [B, T, D_struct]
-    y: torch.Tensor           # [B]
-    cross_mask: torch.Tensor  # [B, 1, S, T]
-    seq_valid: torch.Tensor   # [B, S]
+    seq: torch.Tensor          # [B, S, D_seq]
+    struct: torch.Tensor       # [B, N, D_struct]
+    adj: torch.Tensor          # [B, N, N]
+    y: torch.Tensor            # [B]
+    seq_mask: torch.Tensor     # [B, S]  True = padding (for Transformer src_key_padding_mask)
+    struct_mask: torch.Tensor  # [B, N]  True = padding
+    seq_valid: torch.Tensor    # [B, S]  True = real token (for masked pooling)
 
 
 def collate_fn(batch):
-    seqs, structs, ys = zip(*batch)
-    B      = len(seqs)
-    D_seq  = seqs[0].shape[-1]
-    D_str  = structs[0].shape[-1]
-    S      = max(x.shape[0] for x in seqs)
-    T      = max(x.shape[0] for x in structs)
+    seqs, structs, adjs, ys = zip(*batch)
+    B     = len(seqs)
+    D_seq = seqs[0].shape[-1]
+    D_str = structs[0].shape[-1]
+    S     = max(x.shape[0] for x in seqs)
+    N     = max(x.shape[0] for x in structs)
 
     seq_pad      = torch.zeros(B, S, D_seq)
-    struct_pad   = torch.zeros(B, T, D_str)
+    struct_pad   = torch.zeros(B, N, D_str)
+    adj_pad      = torch.zeros(B, N, N)
     seq_valid    = torch.zeros(B, S, dtype=torch.bool)
-    struct_valid = torch.zeros(B, T, dtype=torch.bool)
+    struct_valid = torch.zeros(B, N, dtype=torch.bool)
 
-    for i, (s, t) in enumerate(zip(seqs, structs)):
-        seq_pad[i,     : s.shape[0]] = s
-        struct_pad[i,  : t.shape[0]] = t
-        seq_valid[i,   : s.shape[0]] = True
-        struct_valid[i,: t.shape[0]] = True
+    for i, (s, t, a) in enumerate(zip(seqs, structs, adjs)):
+        sl, nl = s.shape[0], t.shape[0]
+        seq_pad[i, :sl]          = s
+        struct_pad[i, :nl]       = t
+        adj_pad[i, :nl, :nl]     = a
+        seq_valid[i, :sl]        = True
+        struct_valid[i, :nl]     = True
 
-    # cross_mask[b, 0, s, t] = True  iff  both positions are real tokens
-    cross_mask = (seq_valid.unsqueeze(-1) & struct_valid.unsqueeze(1)).unsqueeze(1)
-    return Batch(seq_pad, struct_pad, torch.stack(ys), cross_mask, seq_valid)
+    # Transformer src_key_padding_mask: True = IGNORE (padding positions)
+    seq_mask    = ~seq_valid
+    struct_mask = ~struct_valid
+
+    return Batch(
+        seq_pad, struct_pad, adj_pad,
+        torch.stack(ys),
+        seq_mask, struct_mask, seq_valid,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Forward pass (masked mean pooling)
+# Masked mean pooling utility
 # ---------------------------------------------------------------------------
 
-def forward_pass(model, seq, struct, cross_mask, seq_valid):
+def masked_mean_pool(x, valid_mask):
     """
-    Applies optional input projections, cross-attention + FFN,
-    masked mean pooling, then the regression head.
+    x:          (B, S, D)
+    valid_mask: (B, S) boolean — True for real tokens
+    returns:    (B, D)
     """
-    if hasattr(model, "seq_proj"):
-        seq = model.seq_proj(seq)
-    if hasattr(model, "struct_proj"):
-        struct = model.struct_proj(struct)
-
-    attn_out = model.cross_attn(x=seq, context=struct, mask=cross_mask)
-    x = model.layer_norm1(seq + attn_out)
-    x = model.layer_norm2(x + model.ffn(x))
-
-    # Masked mean pool — ignore padding tokens
-    seq_valid_f = seq_valid.float().unsqueeze(-1)          # [B, S, 1]
-    pooled = (x * seq_valid_f).sum(1) / seq_valid_f.sum(1).clamp_min(1.0)
-
-    return model.regressor(pooled).squeeze(-1)             # [B]
+    mask_f = valid_mask.float().unsqueeze(-1)          # [B, S, 1]
+    return (x * mask_f).sum(1) / mask_f.sum(1).clamp_min(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -109,15 +156,17 @@ def evaluate(model, loader, device, criterion):
     n = 0
 
     for batch in loader:
-        seq        = batch.seq.to(device)
-        struct     = batch.struct.to(device)
-        y          = batch.y.to(device)
-        cross_mask = batch.cross_mask.to(device)
-        seq_valid  = batch.seq_valid.to(device)
+        seq         = batch.seq.to(device)
+        struct      = batch.struct.to(device)
+        adj         = batch.adj.to(device)
+        y           = batch.y.to(device)
+        seq_mask    = batch.seq_mask.to(device)
+        struct_mask = batch.struct_mask.to(device)
 
-        pred        = forward_pass(model, seq, struct, cross_mask, seq_valid)
-        loss        = criterion(pred, y)
-        bs          = y.size(0)
+        pred = model(seq, struct, adj, seq_mask=seq_mask, struct_mask=struct_mask)
+        loss = criterion(pred, y)
+        bs   = y.size(0)
+
         total_loss += loss.item() * bs
         err         = pred - y
         mae_sum    += err.abs().sum().item()
@@ -133,7 +182,10 @@ def evaluate(model, loader, device, criterion):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path",    type=str,   default="data/dataset.pt")
+    parser.add_argument("--esmc_dir",     type=str,   default="embeddings/esmc_600m_features")
+    parser.add_argument("--saprot_dir",   type=str,   default="embeddings/saprot_650m_features")
+    parser.add_argument("--val_split",    type=float, default=0.1)
+    parser.add_argument("--test_split",   type=float, default=0.1)
     parser.add_argument("--save_dir",     type=str,   default="checkpoints")
     parser.add_argument("--epochs",       type=int,   default=40)
     parser.add_argument("--batch_size",   type=int,   default=8)
@@ -144,24 +196,36 @@ def main():
     parser.add_argument("--patience",     type=int,   default=10)
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--num_workers",  type=int,   default=4)
+    parser.add_argument("--gpus",         type=int,   nargs="+", default=[2,3],
+                        help="GPU IDs to use, e.g. --gpus 0 1 2. Defaults to [2, 3].")
     args = parser.parse_args()
 
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+
+    if torch.cuda.is_available():
+        gpu_ids = args.gpus if args.gpus is not None else list(range(torch.cuda.device_count()))
+        device = torch.device(f"cuda:{gpu_ids[0]}")
+        torch.zeros(1).to(device)   # initialize CUDA context before any model ops
+        print(f"Using GPUs: {gpu_ids}  (primary: {device})")
+    else:
+        gpu_ids = []
+        device = torch.device("cpu")
+        print(f"Using device: {device}")
 
     # ------------------------------------------------------------------
     # Load data
     # ------------------------------------------------------------------
-    print(f"Loading dataset from {args.data_path} ...")
-    data       = torch.load(args.data_path, map_location="cpu")
-    seq_map    = data["seq_map"]
-    struct_map = data["struct_map"]
-    y_map      = data["y_map"]
-    train_ids  = data["train_ids"]
-    val_ids    = data["val_ids"]
-    test_ids   = data["test_ids"]
+    print(f"Loading embeddings from:\n  seq:    {args.esmc_dir}\n  struct: {args.saprot_dir}")
+    all_ids, seq_map, struct_map, y_map = load_embeddings(args.esmc_dir, args.saprot_dir)
+
+    random.shuffle(all_ids)
+    n = len(all_ids)
+    n_test = max(1, int(n * args.test_split))
+    n_val  = max(1, int(n * args.val_split))
+    test_ids  = all_ids[:n_test]
+    val_ids   = all_ids[n_test:n_test + n_val]
+    train_ids = all_ids[n_test + n_val:]
 
     print(f"  train={len(train_ids)}  val={len(val_ids)}  test={len(test_ids)}")
 
@@ -189,7 +253,7 @@ def main():
     # Model
     # ------------------------------------------------------------------
     model = SeqStructToptPredictor(d_model=args.d_model, num_heads=args.num_heads)
-
+    # Add projection layers if embedding dims don't match d_model
     if d_seq != args.d_model:
         model.seq_proj = nn.Linear(d_seq, args.d_model)
         print(f"  Added seq_proj:    {d_seq} → {args.d_model}")
@@ -198,6 +262,9 @@ def main():
         print(f"  Added struct_proj: {d_struct} → {args.d_model}")
 
     model = model.to(device)
+    if len(gpu_ids) > 1:
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        print(f"  Wrapped with DataParallel over GPUs {gpu_ids}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
 
@@ -224,14 +291,15 @@ def main():
         running = n = 0
 
         for batch in train_loader:
-            seq        = batch.seq.to(device)
-            struct     = batch.struct.to(device)
-            y          = batch.y.to(device)
-            cross_mask = batch.cross_mask.to(device)
-            seq_valid  = batch.seq_valid.to(device)
+            seq         = batch.seq.to(device)
+            struct      = batch.struct.to(device)
+            adj         = batch.adj.to(device)
+            y           = batch.y.to(device)
+            seq_mask    = batch.seq_mask.to(device)
+            struct_mask = batch.struct_mask.to(device)
 
             optimizer.zero_grad()
-            pred = forward_pass(model, seq, struct, cross_mask, seq_valid)
+            pred = model(seq, struct, adj, seq_mask=seq_mask, struct_mask=struct_mask)
             loss = criterion(pred, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -253,13 +321,14 @@ def main():
         if val_loss < best_val:
             best_val   = val_loss
             no_improve = 0
+            _state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save(
                 {
-                    "model_state_dict":     model.state_dict(),
+                    "model_state_dict":    _state,
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch":                epoch,
-                    "args":                 vars(args),
-                    "best_val_mse":         best_val,
+                    "epoch":               epoch,
+                    "args":                vars(args),
+                    "best_val_mse":        best_val,
                 },
                 best_path,
             )
@@ -275,7 +344,8 @@ def main():
     # ------------------------------------------------------------------
     print(f"\nBest val MSE: {best_val:.4f}")
     ckpt = torch.load(best_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    _m = model.module if isinstance(model, nn.DataParallel) else model
+    _m.load_state_dict(ckpt["model_state_dict"])
     test_mse, test_mae, test_rmse = evaluate(model, test_loader, device, criterion)
     print(f"Test | mse={test_mse:.4f} | mae={test_mae:.4f} | rmse={test_rmse:.4f}")
 

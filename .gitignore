@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+.vscode/
+.claude/
+
+embeddings/
+checkpoints/
+bin/foldseek
+
+.ipynb_checkpoints/
