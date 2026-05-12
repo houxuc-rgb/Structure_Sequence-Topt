@@ -80,7 +80,11 @@ class SeqStructToptPredictor(nn.Module):
         x = self.ffn_norm(x + ffn_out)
 
         # ===== Global Average Pooling =====
-        pooled = torch.mean(x, dim=1)
+        if seq_mask is None:
+            pooled = torch.mean(x, dim=1)
+        else:
+            valid_mask = (~seq_mask).to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+            pooled = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1.0)
 
         # ===== Predict Topt =====
         t_opt_pred = self.regressor(pooled)
@@ -178,7 +182,11 @@ class SeqStructToptPredictor(nn.Module):
         x = self.ffn_norm(x + ffn_out)
 
         # ===== Global Average Pooling =====
-        pooled = torch.mean(x, dim=1)
+        if seq_mask is None:
+            pooled = torch.mean(x, dim=1)
+        else:
+            valid_mask = (~seq_mask).to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+            pooled = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1.0)
 
         # ===== Predict Topt =====
         t_opt_pred = self.regressor(pooled)
