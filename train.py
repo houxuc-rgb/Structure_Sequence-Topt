@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from model import SeqStructToptPredictor
+from utils.contact_graph import build_contact_adj_for_id
 
 
 # ---------------------------------------------------------------------------
@@ -65,20 +66,64 @@ def set_seed(seed: int = 42):
 # ---------------------------------------------------------------------------
 
 class ProteinDataset(Dataset):
-    def __init__(self, ids, seq_map, struct_map, y_map, adj_map=None):
+    def __init__(
+        self,
+        ids,
+        seq_map,
+        struct_map,
+        y_map,
+        adj_map=None,
+        graph_type="contact",
+        pdb_dir="data/pdbs",
+        contact_cutoff=8.0,
+        strict_contact_graphs=False,
+    ):
         self.ids = ids
         self.seq_map = seq_map
         self.struct_map = struct_map
-        self.adj_map = adj_map
+        self.adj_map = adj_map or {}
         self.y_map = y_map
+        self.graph_type = graph_type
+        self.pdb_dir = pdb_dir
+        self.contact_cutoff = contact_cutoff
+        self.strict_contact_graphs = strict_contact_graphs
+        self._contact_adj_cache = {}
+        self._fallback_warning_count = 0
 
     def __len__(self):
         return len(self.ids)
 
+    def _get_adj(self, pid, num_nodes):
+        if pid in self.adj_map:
+            return self.adj_map[pid]
+
+        if self.graph_type == "sequential":
+            return build_sequential_adj(num_nodes)
+
+        if pid not in self._contact_adj_cache:
+            try:
+                self._contact_adj_cache[pid] = build_contact_adj_for_id(
+                    pid,
+                    self.pdb_dir,
+                    expected_len=num_nodes,
+                    cutoff=self.contact_cutoff,
+                )
+            except Exception as exc:
+                if self.strict_contact_graphs:
+                    raise
+                if self._fallback_warning_count < 10:
+                    print(
+                        f"Warning: falling back to sequential adjacency for {pid}: {exc}"
+                    )
+                    self._fallback_warning_count += 1
+                self._contact_adj_cache[pid] = build_sequential_adj(num_nodes)
+
+        return self._contact_adj_cache[pid]
+
     def __getitem__(self, idx):
         pid = self.ids[idx]
         struct = self.struct_map[pid].float()
-        adj = self.adj_map[pid] if self.adj_map else build_sequential_adj(struct.shape[0])
+        adj = self._get_adj(pid, struct.shape[0])
         return (
             self.seq_map[pid].float(),
             struct,
@@ -184,6 +229,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--esmc_dir",     type=str,   default="embeddings/esmc_600m_features")
     parser.add_argument("--saprot_dir",   type=str,   default="embeddings/saprot_650m_features")
+    parser.add_argument("--pdb_dir",      type=str,   default="data/pdbs")
+    parser.add_argument("--graph_type",   type=str,   default="contact",
+                        choices=["contact", "sequential"],
+                        help="Adjacency for the GCN branch. Use sequential for the old baseline.")
+    parser.add_argument("--contact_cutoff", type=float, default=8.0,
+                        help="C-alpha distance cutoff in Angstrom for contact graph edges.")
+    parser.add_argument("--strict_contact_graphs", action="store_true",
+                        help="Fail instead of falling back when a contact graph cannot be built.")
     parser.add_argument("--val_split",    type=float, default=0.1)
     parser.add_argument("--test_split",   type=float, default=0.1)
     parser.add_argument("--save_dir",     type=str,   default="checkpoints")
@@ -235,7 +288,16 @@ def main():
     print(f"  Embedding dims — seq: {d_seq}  struct: {d_struct}")
 
     def make_loader(ids, shuffle):
-        ds = ProteinDataset(ids, seq_map, struct_map, y_map)
+        ds = ProteinDataset(
+            ids,
+            seq_map,
+            struct_map,
+            y_map,
+            graph_type=args.graph_type,
+            pdb_dir=args.pdb_dir,
+            contact_cutoff=args.contact_cutoff,
+            strict_contact_graphs=args.strict_contact_graphs,
+        )
         return DataLoader(
             ds,
             batch_size=args.batch_size,
